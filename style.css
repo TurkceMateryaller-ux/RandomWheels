@@ -89,6 +89,7 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: clamp(16px, 3vw, 32px)
 .image-picker { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #b8dce5; border-radius: 8px; padding: 5px 8px; color: var(--teal-dark); background: #f4fbfc; cursor: pointer; font-size: .76rem; font-weight: 700; }
 .image-picker svg { width: 15px; height: 15px; flex: 0 0 auto; }
 .image-picker:hover { border-color: var(--teal); background: var(--sky); }
+.image-picker.processing { opacity: .65; cursor: wait; pointer-events: none; }
 .image-preview { display: inline-flex; align-items: center; gap: 5px; }
 .option-thumbnail { width: 38px; height: 38px; border: 1px solid var(--line); border-radius: 8px; object-fit: cover; background: var(--sky); }
 .remove-image { display: grid; width: 27px; height: 27px; place-items: center; border: 0; border-radius: 7px; color: #a51f32; background: #fff0f0; cursor: pointer; font-size: 1rem; }
@@ -106,6 +107,7 @@ main { width: min(1180px, 100%); margin: 0 auto; padding: clamp(16px, 3vw, 32px)
 .wheels-grid.count-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .wheels-grid.count-4 { row-gap: clamp(4px, 1vh, 10px); }
 .wheel-card { min-width: 0; width: 100%; text-align: center; }
+.wheel-card:not(.has-wheel-title) { padding-top: clamp(6px, 1vh, 10px); }
 .wheel-title { margin: 0 0 18px; font-size: clamp(1.05rem, 2.4vw, 1.3rem); line-height: 1.2; text-align: center; overflow-wrap: anywhere; }
 .wheel-wrapper { position: relative; margin: 0 auto 6px; padding-top: 22px; }
 .wheel-stage { position: relative; isolation: isolate; width: 100%; aspect-ratio: 1; }

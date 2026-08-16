@@ -8,14 +8,15 @@ import {
 } from 'https://www.gstatic.com/firebasejs/12.17.1/firebase-auth.js';
 import {
   getFirestore,
+  Bytes,
   collection,
   collectionGroup,
-  deleteDoc,
   doc,
   getDoc,
   getDocs,
   serverTimestamp,
   setDoc,
+  writeBatch,
   query,
   where
 } from 'https://www.gstatic.com/firebasejs/12.17.1/firebase-firestore.js';
@@ -37,18 +38,19 @@ export {
   app,
   auth,
   db,
+  Bytes,
   GoogleAuthProvider,
   onAuthStateChanged,
   signInWithPopup,
   signOut,
   collection,
   collectionGroup,
-  deleteDoc,
   doc,
   getDoc,
   getDocs,
   serverTimestamp,
   setDoc,
+  writeBatch,
   query,
   where
 };

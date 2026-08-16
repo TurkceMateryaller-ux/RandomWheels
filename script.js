@@ -1,18 +1,19 @@
 import {
   auth,
   db,
+  Bytes,
   GoogleAuthProvider,
   onAuthStateChanged,
   signInWithPopup,
   signOut,
   collection,
   collectionGroup,
-  deleteDoc,
   doc,
   getDoc,
   getDocs,
   serverTimestamp,
   setDoc,
+  writeBatch,
   query,
   where
 } from './firebase.js';
@@ -29,18 +30,25 @@ document.addEventListener('DOMContentLoaded', () => {
     { fill: '#E68136', text: '#082D5A' }
   ];
   const maxFileSize = 5 * 1024 * 1024;
+  const maxProcessedImageSize = 100 * 1024;
+  const imageDimensionSteps = [512, 384, 320, 256];
+  const imageQualitySteps = [.82, .75, .68, .61, .54, .47, .4];
   const imageCache = new Map();
   let nextOptionId = 1;
 
   const createOption = text => ({
     id: `option-${nextOptionId++}`,
     text,
+    imageBlob: null,
     imageUrl: '',
-    imageName: ''
+    imageName: '',
+    imageId: null,
+    imageWidth: null,
+    imageHeight: null
   });
   const defaultOptions = () => [1, 2, 3, 4].map(number => createOption(`Вариант ${number}`));
-  const wheels = Array.from({ length: 4 }, (_, index) => ({
-    title: `Колесо ${index + 1}`,
+  const wheels = Array.from({ length: 4 }, () => ({
+    title: '',
     options: defaultOptions(),
     rotation: 0,
     spinning: false,
@@ -101,11 +109,100 @@ document.addEventListener('DOMContentLoaded', () => {
     errorMessage.hidden = false;
   }
 
-  function releaseImage(option) {
+  function revokeOptionUrl(option) {
     if (option.imageUrl && option.imageUrl.startsWith('blob:')) URL.revokeObjectURL(option.imageUrl);
     imageCache.delete(option.imageUrl);
     option.imageUrl = '';
+  }
+
+  function releaseImage(option) {
+    revokeOptionUrl(option);
+    option.imageBlob = null;
     option.imageName = '';
+    option.imageId = null;
+    option.imageWidth = null;
+    option.imageHeight = null;
+  }
+
+  function canvasToWebP(canvas, quality) {
+    return new Promise((resolve, reject) => {
+      canvas.toBlob(blob => {
+        if (blob?.type === 'image/webp') resolve(blob);
+        else reject(new Error('Этот браузер не поддерживает преобразование изображений в WebP.'));
+      }, 'image/webp', quality);
+    });
+  }
+
+  async function decodeImageFile(file) {
+    if ('createImageBitmap' in window) {
+      try {
+        const bitmap = await createImageBitmap(file);
+        return {
+          source: bitmap,
+          width: bitmap.width,
+          height: bitmap.height,
+          release: () => bitmap.close()
+        };
+      } catch (error) {
+        console.info('createImageBitmap недоступен для этого файла, используется резервное декодирование.');
+      }
+    }
+    const sourceUrl = URL.createObjectURL(file);
+    const image = new Image();
+    try {
+      await new Promise((resolve, reject) => {
+        image.onload = resolve;
+        image.onerror = () => reject(new Error('Не удалось декодировать выбранное изображение.'));
+        image.src = sourceUrl;
+      });
+      return {
+        source: image,
+        width: image.naturalWidth,
+        height: image.naturalHeight,
+        release: () => URL.revokeObjectURL(sourceUrl)
+      };
+    } catch (error) {
+      URL.revokeObjectURL(sourceUrl);
+      throw error;
+    }
+  }
+
+  async function processSelectedImage(file) {
+    const decoded = await decodeImageFile(file);
+    try {
+      if (!decoded.width || !decoded.height) throw new Error('Изображение имеет некорректный размер.');
+      const originalMaxSide = Math.max(decoded.width, decoded.height);
+      const limits = imageDimensionSteps.filter((limit, index) => index === 0 || originalMaxSide > limit);
+      let lastResult = null;
+
+      for (const maxSide of limits) {
+        const scale = Math.min(1, maxSide / originalMaxSide);
+        const width = Math.max(1, Math.round(decoded.width * scale));
+        const height = Math.max(1, Math.round(decoded.height * scale));
+        if (lastResult && lastResult.width === width && lastResult.height === height) continue;
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const context = canvas.getContext('2d');
+        if (!context) throw new Error('Браузер не поддерживает обработку изображения через Canvas.');
+        context.drawImage(decoded.source, 0, 0, width, height);
+
+        for (const quality of imageQualitySteps) {
+          const blob = await canvasToWebP(canvas, quality);
+          lastResult = { blob, width, height };
+          if (blob.size <= maxProcessedImageSize) return lastResult;
+        }
+      }
+      if (lastResult && lastResult.blob.size <= maxProcessedImageSize) return lastResult;
+      throw new Error('Не удалось уменьшить изображение примерно до 100 КБ. Выберите менее детализированный файл.');
+    } finally {
+      decoded.release();
+    }
+  }
+
+  function webPFileName(originalName) {
+    const baseName = originalName.replace(/\.[^.]+$/, '').trim() || 'image';
+    return `${baseName}.webp`;
   }
 
   function createImageTools(option, wheelIndex) {
@@ -121,7 +218,7 @@ document.addEventListener('DOMContentLoaded', () => {
     picker.className = 'image-picker';
     picker.htmlFor = fileId;
     picker.innerHTML = '<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg><span>Добавить картинку</span>';
-    fileInput.addEventListener('change', event => {
+    fileInput.addEventListener('change', async event => {
       const file = event.target.files[0];
       if (!file) return;
       if (file.size > maxFileSize) {
@@ -134,12 +231,38 @@ document.addEventListener('DOMContentLoaded', () => {
         fileInput.value = '';
         return;
       }
-      releaseImage(option);
-      option.imageUrl = URL.createObjectURL(file);
-      option.imageName = file.name;
-      wheels[wheelIndex].result = null;
-      clearError();
-      renderEditors();
+      const pickerText = picker.querySelector('span:last-child');
+      fileInput.disabled = true;
+      picker.classList.add('processing');
+      picker.setAttribute('aria-disabled', 'true');
+      pickerText.textContent = 'Обработка…';
+      try {
+        const processed = await processSelectedImage(file);
+        const existingImageId = option.imageId || null;
+        revokeOptionUrl(option);
+        option.imageBlob = processed.blob;
+        option.imageUrl = URL.createObjectURL(processed.blob);
+        option.imageName = webPFileName(file.name);
+        option.imageId = existingImageId;
+        option.imageWidth = processed.width;
+        option.imageHeight = processed.height;
+        wheels[wheelIndex].result = null;
+        clearError();
+        console.info('Изображение обработано:', {
+          width: processed.width,
+          height: processed.height,
+          sizeKB: Math.round(processed.blob.size / 1024)
+        });
+        renderEditors();
+      } catch (error) {
+        console.error('Ошибка обработки изображения:', error);
+        showError(error?.message || 'Не удалось обработать изображение. Попробуйте другой файл.');
+        fileInput.value = '';
+        fileInput.disabled = false;
+        picker.classList.remove('processing');
+        picker.removeAttribute('aria-disabled');
+        pickerText.textContent = 'Добавить картинку';
+      }
     });
     tools.append(fileInput, picker);
 
@@ -402,7 +525,14 @@ document.addEventListener('DOMContentLoaded', () => {
     wheels.slice(0, visibleCount).forEach((wheel, index) => {
       const card = wheelTemplate.content.firstElementChild.cloneNode(true);
       const canvas = card.querySelector('.wheel-canvas');
-      card.querySelector('.wheel-title').textContent = wheel.title.trim() || `Колесо ${index + 1}`;
+      const title = wheel.title.trim();
+      const titleElement = card.querySelector('.wheel-title');
+      if (title) {
+        titleElement.textContent = title;
+        card.classList.add('has-wheel-title');
+      } else {
+        titleElement.remove();
+      }
       canvas.style.transform = `rotate(${wheel.rotation}deg)`;
       showResult(card.querySelector('.result'), wheel.result);
       card.querySelector('.spin-one').addEventListener('click', () => spinWheel(index));
@@ -535,8 +665,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function resetToNewSet() {
     clearAllLocalImages();
-    wheels.splice(0, wheels.length, ...Array.from({ length: 4 }, (_, index) => ({
-      title: `Колесо ${index + 1}`,
+    wheels.splice(0, wheels.length, ...Array.from({ length: 4 }, () => ({
+      title: '',
       options: defaultOptions(),
       rotation: 0,
       spinning: false,
@@ -552,20 +682,16 @@ document.addEventListener('DOMContentLoaded', () => {
     renderEditors();
   }
 
-  function serializeWheels() {
+  function serializeWheels(pendingImageIds = new Map()) {
     return wheels.slice(0, visibleCount).map(wheel => ({
-      title: wheel.title,
+      title: wheel.title.trim(),
       options: wheel.options.map(option => ({
         id: option.id,
         text: option.text,
-        imageUrl: null,
+        imageId: pendingImageIds.get(option) || option.imageId || null,
         imageName: option.imageName || ''
       }))
     }));
-  }
-
-  function hasLocalImages() {
-    return wheels.slice(0, visibleCount).some(wheel => wheel.options.some(option => option.imageUrl || option.imageName));
   }
 
   async function saveCurrentSet() {
@@ -580,7 +706,7 @@ document.addEventListener('DOMContentLoaded', () => {
           name: currentSetName,
           wheelCount: visibleCount,
           wheels: serializeWheels()
-        });
+        }, saveSetButton);
       }
       return;
     }
@@ -603,19 +729,47 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
     const visibility = saveDialog.querySelector('input[name="visibility"]:checked').value;
-    if (hasLocalImages()) {
-      window.alert('Текстовые данные будут сохранены. Облачное хранение картинок будет подключено позднее');
-    }
 
-    await runBusy(confirmSaveButton, 'Сохранение…', async () => {
+    await runBusy(confirmSaveButton, 'Сохраняем картинки…', async () => {
       try {
         const setRef = currentSetId
           ? doc(db, 'users', currentUser.uid, 'wheelSets', currentSetId)
           : doc(collection(db, 'users', currentUser.uid, 'wheelSets'));
+        const imagesRef = collection(setRef, 'images');
+        const existingImages = await getDocs(imagesRef);
+        const existingImageIds = new Set(existingImages.docs.map(snapshot => snapshot.id));
+        const pendingImageIds = new Map();
+        const pendingUploads = [];
+        const reservedIds = new Set();
+
+        wheels.slice(0, visibleCount).forEach(wheel => {
+          wheel.options.forEach(option => {
+            if (!option.imageBlob) return;
+            let imageId = option.imageId;
+            if (!imageId || reservedIds.has(imageId)) imageId = doc(imagesRef).id;
+            reservedIds.add(imageId);
+            pendingImageIds.set(option, imageId);
+            pendingUploads.push({ option, imageId });
+          });
+        });
+
+        const usedImageIds = new Set();
+        wheels.slice(0, visibleCount).forEach(wheel => {
+          wheel.options.forEach(option => {
+            const imageId = pendingImageIds.get(option) || option.imageId;
+            if (imageId) usedImageIds.add(imageId);
+          });
+        });
+        const orphanedImages = existingImages.docs.filter(snapshot => !usedImageIds.has(snapshot.id));
+        const operationCount = 1 + pendingUploads.length + orphanedImages.length;
+        if (operationCount > 499) {
+          throw new Error('Слишком много изменений изображений для одного сохранения. Сохраните набор меньшими этапами.');
+        }
+
         const data = {
           name,
           wheelCount: visibleCount,
-          wheels: serializeWheels(),
+          wheels: serializeWheels(pendingImageIds),
           ownerId: currentUser.uid,
           authorName: currentUser.displayName || 'Пользователь',
           visibility,
@@ -623,7 +777,34 @@ document.addEventListener('DOMContentLoaded', () => {
         };
         if (currentCopiedFrom) data.copiedFrom = currentCopiedFrom;
         if (!currentSetId) data.createdAt = serverTimestamp();
-        await setDoc(setRef, data, { merge: Boolean(currentSetId) });
+        const batch = writeBatch(db);
+        batch.set(setRef, data, { merge: Boolean(currentSetId) });
+
+        for (const { option, imageId } of pendingUploads) {
+          if (!option.imageWidth || !option.imageHeight) {
+            throw new Error(`Не удалось определить размеры изображения «${option.imageName || imageId}».`);
+          }
+          const bytes = Bytes.fromUint8Array(new Uint8Array(await option.imageBlob.arrayBuffer()));
+          const imageData = {
+            data: bytes,
+            contentType: 'image/webp',
+            imageName: option.imageName || 'image.webp',
+            width: option.imageWidth,
+            height: option.imageHeight,
+            size: option.imageBlob.size,
+            updatedAt: serverTimestamp()
+          };
+          const imageExists = existingImageIds.has(imageId);
+          if (!imageExists) imageData.createdAt = serverTimestamp();
+          batch.set(doc(imagesRef, imageId), imageData, { merge: imageExists });
+        }
+        orphanedImages.forEach(snapshot => batch.delete(snapshot.ref));
+        await batch.commit();
+
+        pendingUploads.forEach(({ option, imageId }) => {
+          option.imageId = imageId;
+          option.imageBlob = null;
+        });
         currentSetId = setRef.id;
         currentSetName = name;
         currentVisibility = visibility;
@@ -632,7 +813,7 @@ document.addEventListener('DOMContentLoaded', () => {
         showAppMessage('Набор сохранён.');
       } catch (error) {
         console.error('Ошибка сохранения набора:', error);
-        showAppMessage('Не удалось сохранить набор. Проверьте подключение и правила доступа Firestore.', true);
+        showAppMessage(error?.message || 'Не удалось сохранить набор и картинки. Проверьте подключение и правила доступа Firestore.', true);
       }
     });
   }
@@ -647,9 +828,18 @@ document.addEventListener('DOMContentLoaded', () => {
     return {
       id: rawOption?.id || `option-${nextOptionId++}`,
       text: typeof rawOption?.text === 'string' ? rawOption.text : '',
+      imageBlob: null,
       imageUrl: '',
-      imageName: typeof rawOption?.imageName === 'string' ? rawOption.imageName : ''
+      imageName: typeof rawOption?.imageName === 'string' ? rawOption.imageName : '',
+      imageId: rawOption?.imageId || null,
+      imageWidth: null,
+      imageHeight: null
     };
+  }
+
+  function restoredWheelTitle(title) {
+    if (typeof title !== 'string') return '';
+    return /^Колесо [1-4]$/.test(title) ? '' : title;
   }
 
   function applySetData(setId, data, publicSource = null) {
@@ -658,13 +848,13 @@ document.addEventListener('DOMContentLoaded', () => {
     const restored = Array.from({ length: 4 }, (_, index) => {
       const savedWheel = savedWheels[index];
       return savedWheel ? {
-        title: typeof savedWheel.title === 'string' ? savedWheel.title : `Колесо ${index + 1}`,
+        title: restoredWheelTitle(savedWheel.title),
         options: Array.isArray(savedWheel.options) ? savedWheel.options.map(deserializeOption) : defaultOptions(),
         rotation: 0,
         spinning: false,
         result: null
       } : {
-        title: `Колесо ${index + 1}`,
+        title: '',
         options: defaultOptions(),
         rotation: 0,
         spinning: false,
@@ -682,6 +872,47 @@ document.addEventListener('DOMContentLoaded', () => {
     renderEditors();
   }
 
+  async function hydrateCloudImages(setPath) {
+    const optionsWithImages = wheels
+      .slice(0, visibleCount)
+      .flatMap(wheel => wheel.options)
+      .filter(option => option.imageId);
+
+    if (!optionsWithImages.length) return 0;
+
+    const imageSnapshots = await getDocs(collection(db, `${setPath}/images`));
+    const imagesById = new Map(imageSnapshots.docs.map(snapshot => [snapshot.id, snapshot]));
+    let failedCount = 0;
+
+    optionsWithImages.forEach(option => {
+      try {
+        const imageSnapshot = imagesById.get(option.imageId);
+        if (!imageSnapshot) throw new Error('Документ изображения не найден.');
+
+        const imageData = imageSnapshot.data();
+        if (!imageData.data || typeof imageData.data.toUint8Array !== 'function') {
+          throw new Error('Некорректные данные изображения.');
+        }
+
+        if (imageData.contentType !== 'image/webp') throw new Error('Неподдерживаемый формат изображения.');
+        const bytes = imageData.data.toUint8Array();
+        const blob = new Blob([bytes], { type: imageData.contentType });
+        if (!blob.size || blob.size > 112640) throw new Error('Некорректный размер изображения.');
+
+        option.imageBlob = null;
+        option.imageUrl = URL.createObjectURL(blob);
+        option.imageName = typeof imageData.imageName === 'string' ? imageData.imageName : option.imageName;
+        option.imageWidth = Number.isFinite(imageData.width) ? imageData.width : null;
+        option.imageHeight = Number.isFinite(imageData.height) ? imageData.height : null;
+      } catch (error) {
+        failedCount += 1;
+        console.warn(`Не удалось восстановить изображение ${option.imageId}:`, error);
+      }
+    });
+
+    return failedCount;
+  }
+
   async function openSet(setId, button) {
     if (!currentUser) return;
     await runBusy(button, 'Загрузка…', async () => {
@@ -692,8 +923,17 @@ document.addEventListener('DOMContentLoaded', () => {
           return;
         }
         applySetData(snapshot.id, snapshot.data());
+        let imageWarning = '';
+        try {
+          const failedCount = await hydrateCloudImages(snapshot.ref.path);
+          if (failedCount) imageWarning = ` Не удалось загрузить изображений: ${failedCount}.`;
+        } catch (imageError) {
+          console.warn('Не удалось загрузить облачные изображения набора:', imageError);
+          imageWarning = ' Картинки временно не удалось загрузить, но текстовые данные открыты.';
+        }
+        renderEditors();
         setsDialog.close();
-        showAppMessage(`Набор «${currentSetName || 'Без названия'}» загружен.`);
+        showAppMessage(`Набор «${currentSetName || 'Без названия'}» загружен.${imageWarning}`, Boolean(imageWarning));
       } catch (error) {
         console.error('Ошибка загрузки набора:', error);
         showAppMessage('Не удалось загрузить набор. Попробуйте ещё раз.', true);
@@ -705,7 +945,15 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!currentUser || !window.confirm(`Удалить набор «${name}»? Это действие нельзя отменить.`)) return;
     await runBusy(button, 'Удаление…', async () => {
       try {
-        await deleteDoc(doc(db, 'users', currentUser.uid, 'wheelSets', setId));
+        const setRef = doc(db, 'users', currentUser.uid, 'wheelSets', setId);
+        const imageSnapshots = await getDocs(collection(setRef, 'images'));
+        if (imageSnapshots.size > 498) {
+          throw new Error('В наборе слишком много изображений для безопасного удаления одной операцией.');
+        }
+        const batch = writeBatch(db);
+        imageSnapshots.forEach(snapshot => batch.delete(snapshot.ref));
+        batch.delete(setRef);
+        await batch.commit();
         if (currentSetId === setId) {
           currentSetId = null;
           currentSetName = '';
@@ -821,16 +1069,17 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  function sanitizeStoredWheels(data) {
-    return (Array.isArray(data.wheels) ? data.wheels : []).slice(0, 4).map((wheel, wheelIndex) => ({
-      title: typeof wheel?.title === 'string' ? wheel.title : `Колесо ${wheelIndex + 1}`,
+  function sanitizeStoredWheels(data, imageIdMap = new Map()) {
+    return (Array.isArray(data.wheels) ? data.wheels : []).slice(0, 4).map(wheel => ({
+      title: restoredWheelTitle(wheel?.title),
       options: (Array.isArray(wheel?.options) ? wheel.options : []).map(rawOption => {
         const option = typeof rawOption === 'string' ? { text: rawOption } : (rawOption || {});
+        const copiedImageId = option.imageId ? imageIdMap.get(option.imageId) || null : null;
         return {
           id: option.id || `copied-${nextOptionId++}`,
           text: typeof option.text === 'string' ? option.text : '',
-          imageUrl: null,
-          imageName: typeof option.imageName === 'string' ? option.imageName : ''
+          imageId: copiedImageId,
+          imageName: copiedImageId && typeof option.imageName === 'string' ? option.imageName : ''
         };
       })
     }));
@@ -842,12 +1091,47 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
     const action = async () => {
+      let operationStage = 'read';
       try {
+        const sourceRef = doc(db, sourcePath);
+        const sourceImages = await getDocs(collection(sourceRef, 'images'));
+        operationStage = 'prepare';
+        const sourceImagesById = new Map(sourceImages.docs.map(snapshot => [snapshot.id, snapshot]));
+        const referencedImageIds = new Set();
+        (Array.isArray(data.wheels) ? data.wheels : []).slice(0, 4).forEach(wheel => {
+          (Array.isArray(wheel?.options) ? wheel.options : []).forEach(rawOption => {
+            const option = typeof rawOption === 'string' ? null : rawOption;
+            if (typeof option?.imageId === 'string' && option.imageId) referencedImageIds.add(option.imageId);
+          });
+        });
+
+        const copyRef = doc(collection(db, 'users', currentUser.uid, 'wheelSets'));
+        const copyImagesRef = collection(copyRef, 'images');
+        const imageIdMap = new Map();
+        const imagesToCopy = [];
+        let missingImageCount = 0;
+
+        referencedImageIds.forEach(oldImageId => {
+          const sourceImage = sourceImagesById.get(oldImageId);
+          if (!sourceImage) {
+            missingImageCount += 1;
+            return;
+          }
+          const newImageRef = doc(copyImagesRef);
+          imageIdMap.set(oldImageId, newImageRef.id);
+          imagesToCopy.push({ sourceImage, newImageRef });
+        });
+
+        const operationCount = 1 + imagesToCopy.length;
+        if (operationCount > 450) {
+          throw new Error('В наборе слишком много картинок: для безопасного копирования допускается не более 449 изображений.');
+        }
+
         const copyName = `Копия — ${data.name || 'Без названия'}`;
         const copiedData = {
           name: copyName,
           wheelCount: Math.max(1, Math.min(4, Number(data.wheelCount) || 1)),
-          wheels: sanitizeStoredWheels(data),
+          wheels: sanitizeStoredWheels(data, imageIdMap),
           ownerId: currentUser.uid,
           authorName: currentUser.displayName || 'Пользователь',
           visibility: 'private',
@@ -855,22 +1139,57 @@ document.addEventListener('DOMContentLoaded', () => {
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp()
         };
-        const copyRef = doc(collection(db, 'users', currentUser.uid, 'wheelSets'));
-        await setDoc(copyRef, copiedData);
+        const batch = writeBatch(db);
+        batch.set(copyRef, copiedData);
+        imagesToCopy.forEach(({ sourceImage, newImageRef }) => {
+          const sourceImageData = sourceImage.data();
+          batch.set(newImageRef, {
+            data: sourceImageData.data,
+            contentType: sourceImageData.contentType,
+            imageName: sourceImageData.imageName,
+            width: sourceImageData.width,
+            height: sourceImageData.height,
+            size: sourceImageData.size,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp()
+          });
+        });
+        operationStage = 'write';
+        await batch.commit();
+
         applySetData(copyRef.id, copiedData);
-        currentCopiedFrom = sourcePath;
+        let restoreWarning = false;
+        try {
+          const failedCount = await hydrateCloudImages(copyRef.path);
+          restoreWarning = failedCount > 0;
+        } catch (imageError) {
+          restoreWarning = imagesToCopy.length > 0;
+          console.warn('Копия создана, но её изображения не удалось сразу открыть:', imageError);
+        }
+        renderEditors();
         if (publicDialog.open) publicDialog.close();
-        showAppMessage('Набор добавлен в “Мои наборы”.');
+        await loadSets();
+        const hasWarning = missingImageCount > 0 || restoreWarning;
+        const warningText = missingImageCount > 0
+          ? ` Не найдено картинок: ${missingImageCount}; соответствующие варианты скопированы без них.`
+          : (restoreWarning ? ' Некоторые картинки не удалось сразу отобразить; они сохранены в копии.' : '');
+        showAppMessage(`Набор и картинки добавлены в “Мои наборы”.${warningText}`, hasWarning);
       } catch (error) {
         console.error('Ошибка копирования набора:', error);
-        showAppMessage('Не удалось добавить набор в «Мои наборы».', true);
+        const fallback = operationStage === 'read'
+          ? 'Не удалось прочитать картинки публичного набора.'
+          : (operationStage === 'write'
+              ? 'Не удалось записать личную копию набора и картинок.'
+              : 'Не удалось подготовить набор и картинки к копированию.');
+        const details = error?.message ? ` Причина: ${error.message}` : '';
+        showAppMessage(`${fallback}${details}`, true);
       }
     };
-    if (button) await runBusy(button, 'Добавление…', action);
+    if (button) await runBusy(button, 'Копирование набора и картинок…', action);
     else await action();
   }
 
-  function openPublicSet(snapshot) {
+  async function openPublicSet(snapshot) {
     const data = snapshot.data();
     const isOwner = Boolean(currentUser && data.ownerId === currentUser.uid);
     applySetData(isOwner ? snapshot.id : null, data, isOwner ? null : {
@@ -878,9 +1197,19 @@ document.addEventListener('DOMContentLoaded', () => {
       ownerId: data.ownerId || '',
       data
     });
+    let imageWarning = '';
+    try {
+      const failedCount = await hydrateCloudImages(snapshot.ref.path);
+      if (failedCount) imageWarning = ` Не удалось загрузить изображений: ${failedCount}.`;
+    } catch (imageError) {
+      console.warn('Не удалось загрузить изображения общего набора:', imageError);
+      imageWarning = ' Картинки временно не удалось загрузить.';
+    }
+    renderEditors();
     publicDialog.close();
     showGame();
-    if (!isOwner) showAppMessage('Открыт общедоступный набор. Чтобы изменить и сохранить его, сначала добавьте копию в свои.');
+    if (!isOwner) showAppMessage(`Открыт общедоступный набор. Чтобы изменить и сохранить его, сначала добавьте копию в свои.${imageWarning}`, Boolean(imageWarning));
+    else if (imageWarning) showAppMessage(imageWarning.trim(), true);
   }
 
   function renderPublicSets() {
