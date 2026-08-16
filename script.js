@@ -47,8 +47,8 @@ document.addEventListener('DOMContentLoaded', () => {
     imageHeight: null
   });
   const defaultOptions = () => [1, 2, 3, 4].map(number => createOption(`Вариант ${number}`));
-  const wheels = Array.from({ length: 4 }, (_, index) => ({
-    title: `Колесо ${index + 1}`,
+  const wheels = Array.from({ length: 4 }, () => ({
+    title: '',
     options: defaultOptions(),
     rotation: 0,
     spinning: false,
@@ -525,7 +525,14 @@ document.addEventListener('DOMContentLoaded', () => {
     wheels.slice(0, visibleCount).forEach((wheel, index) => {
       const card = wheelTemplate.content.firstElementChild.cloneNode(true);
       const canvas = card.querySelector('.wheel-canvas');
-      card.querySelector('.wheel-title').textContent = wheel.title.trim() || `Колесо ${index + 1}`;
+      const title = wheel.title.trim();
+      const titleElement = card.querySelector('.wheel-title');
+      if (title) {
+        titleElement.textContent = title;
+        card.classList.add('has-wheel-title');
+      } else {
+        titleElement.remove();
+      }
       canvas.style.transform = `rotate(${wheel.rotation}deg)`;
       showResult(card.querySelector('.result'), wheel.result);
       card.querySelector('.spin-one').addEventListener('click', () => spinWheel(index));
@@ -658,8 +665,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function resetToNewSet() {
     clearAllLocalImages();
-    wheels.splice(0, wheels.length, ...Array.from({ length: 4 }, (_, index) => ({
-      title: `Колесо ${index + 1}`,
+    wheels.splice(0, wheels.length, ...Array.from({ length: 4 }, () => ({
+      title: '',
       options: defaultOptions(),
       rotation: 0,
       spinning: false,
@@ -677,7 +684,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   function serializeWheels(pendingImageIds = new Map()) {
     return wheels.slice(0, visibleCount).map(wheel => ({
-      title: wheel.title,
+      title: wheel.title.trim(),
       options: wheel.options.map(option => ({
         id: option.id,
         text: option.text,
@@ -830,19 +837,24 @@ document.addEventListener('DOMContentLoaded', () => {
     };
   }
 
+  function restoredWheelTitle(title) {
+    if (typeof title !== 'string') return '';
+    return /^Колесо [1-4]$/.test(title) ? '' : title;
+  }
+
   function applySetData(setId, data, publicSource = null) {
     clearAllLocalImages();
     const savedWheels = Array.isArray(data.wheels) ? data.wheels.slice(0, 4) : [];
     const restored = Array.from({ length: 4 }, (_, index) => {
       const savedWheel = savedWheels[index];
       return savedWheel ? {
-        title: typeof savedWheel.title === 'string' ? savedWheel.title : `Колесо ${index + 1}`,
+        title: restoredWheelTitle(savedWheel.title),
         options: Array.isArray(savedWheel.options) ? savedWheel.options.map(deserializeOption) : defaultOptions(),
         rotation: 0,
         spinning: false,
         result: null
       } : {
-        title: `Колесо ${index + 1}`,
+        title: '',
         options: defaultOptions(),
         rotation: 0,
         spinning: false,
@@ -1058,8 +1070,8 @@ document.addEventListener('DOMContentLoaded', () => {
   }
 
   function sanitizeStoredWheels(data) {
-    return (Array.isArray(data.wheels) ? data.wheels : []).slice(0, 4).map((wheel, wheelIndex) => ({
-      title: typeof wheel?.title === 'string' ? wheel.title : `Колесо ${wheelIndex + 1}`,
+    return (Array.isArray(data.wheels) ? data.wheels : []).slice(0, 4).map(wheel => ({
+      title: restoredWheelTitle(wheel?.title),
       options: (Array.isArray(wheel?.options) ? wheel.options : []).map(rawOption => {
         const option = typeof rawOption === 'string' ? { text: rawOption } : (rawOption || {});
         return {
