@@ -1,18 +1,19 @@
 import {
   auth,
   db,
+  Bytes,
   GoogleAuthProvider,
   onAuthStateChanged,
   signInWithPopup,
   signOut,
   collection,
   collectionGroup,
-  deleteDoc,
   doc,
   getDoc,
   getDocs,
   serverTimestamp,
   setDoc,
+  writeBatch,
   query,
   where
 } from './firebase.js';
@@ -41,7 +42,9 @@ document.addEventListener('DOMContentLoaded', () => {
     imageBlob: null,
     imageUrl: '',
     imageName: '',
-    imageId: null
+    imageId: null,
+    imageWidth: null,
+    imageHeight: null
   });
   const defaultOptions = () => [1, 2, 3, 4].map(number => createOption(`Вариант ${number}`));
   const wheels = Array.from({ length: 4 }, (_, index) => ({
@@ -117,6 +120,8 @@ document.addEventListener('DOMContentLoaded', () => {
     option.imageBlob = null;
     option.imageName = '';
     option.imageId = null;
+    option.imageWidth = null;
+    option.imageHeight = null;
   }
 
   function canvasToWebP(canvas, quality) {
@@ -239,6 +244,8 @@ document.addEventListener('DOMContentLoaded', () => {
         option.imageUrl = URL.createObjectURL(processed.blob);
         option.imageName = webPFileName(file.name);
         option.imageId = existingImageId;
+        option.imageWidth = processed.width;
+        option.imageHeight = processed.height;
         wheels[wheelIndex].result = null;
         clearError();
         console.info('Изображение обработано:', {
@@ -668,21 +675,16 @@ document.addEventListener('DOMContentLoaded', () => {
     renderEditors();
   }
 
-  function serializeWheels() {
+  function serializeWheels(pendingImageIds = new Map()) {
     return wheels.slice(0, visibleCount).map(wheel => ({
       title: wheel.title,
       options: wheel.options.map(option => ({
         id: option.id,
         text: option.text,
-        imageId: option.imageId || null,
-        imageUrl: null,
+        imageId: pendingImageIds.get(option) || option.imageId || null,
         imageName: option.imageName || ''
       }))
     }));
-  }
-
-  function hasLocalImages() {
-    return wheels.slice(0, visibleCount).some(wheel => wheel.options.some(option => option.imageUrl || option.imageName));
   }
 
   async function saveCurrentSet() {
@@ -720,19 +722,47 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
     const visibility = saveDialog.querySelector('input[name="visibility"]:checked').value;
-    if (hasLocalImages()) {
-      window.alert('Текстовые данные будут сохранены. Облачное хранение картинок будет подключено позднее');
-    }
 
-    await runBusy(confirmSaveButton, 'Сохранение…', async () => {
+    await runBusy(confirmSaveButton, 'Сохраняем картинки…', async () => {
       try {
         const setRef = currentSetId
           ? doc(db, 'users', currentUser.uid, 'wheelSets', currentSetId)
           : doc(collection(db, 'users', currentUser.uid, 'wheelSets'));
+        const imagesRef = collection(setRef, 'images');
+        const existingImages = await getDocs(imagesRef);
+        const existingImageIds = new Set(existingImages.docs.map(snapshot => snapshot.id));
+        const pendingImageIds = new Map();
+        const pendingUploads = [];
+        const reservedIds = new Set();
+
+        wheels.slice(0, visibleCount).forEach(wheel => {
+          wheel.options.forEach(option => {
+            if (!option.imageBlob) return;
+            let imageId = option.imageId;
+            if (!imageId || reservedIds.has(imageId)) imageId = doc(imagesRef).id;
+            reservedIds.add(imageId);
+            pendingImageIds.set(option, imageId);
+            pendingUploads.push({ option, imageId });
+          });
+        });
+
+        const usedImageIds = new Set();
+        wheels.slice(0, visibleCount).forEach(wheel => {
+          wheel.options.forEach(option => {
+            const imageId = pendingImageIds.get(option) || option.imageId;
+            if (imageId) usedImageIds.add(imageId);
+          });
+        });
+        const orphanedImages = existingImages.docs.filter(snapshot => !usedImageIds.has(snapshot.id));
+        const operationCount = 1 + pendingUploads.length + orphanedImages.length;
+        if (operationCount > 499) {
+          throw new Error('Слишком много изменений изображений для одного сохранения. Сохраните набор меньшими этапами.');
+        }
+
         const data = {
           name,
           wheelCount: visibleCount,
-          wheels: serializeWheels(),
+          wheels: serializeWheels(pendingImageIds),
           ownerId: currentUser.uid,
           authorName: currentUser.displayName || 'Пользователь',
           visibility,
@@ -740,7 +770,34 @@ document.addEventListener('DOMContentLoaded', () => {
         };
         if (currentCopiedFrom) data.copiedFrom = currentCopiedFrom;
         if (!currentSetId) data.createdAt = serverTimestamp();
-        await setDoc(setRef, data, { merge: Boolean(currentSetId) });
+        const batch = writeBatch(db);
+        batch.set(setRef, data, { merge: Boolean(currentSetId) });
+
+        for (const { option, imageId } of pendingUploads) {
+          if (!option.imageWidth || !option.imageHeight) {
+            throw new Error(`Не удалось определить размеры изображения «${option.imageName || imageId}».`);
+          }
+          const bytes = Bytes.fromUint8Array(new Uint8Array(await option.imageBlob.arrayBuffer()));
+          const imageData = {
+            data: bytes,
+            contentType: 'image/webp',
+            imageName: option.imageName || 'image.webp',
+            width: option.imageWidth,
+            height: option.imageHeight,
+            size: option.imageBlob.size,
+            updatedAt: serverTimestamp()
+          };
+          const imageExists = existingImageIds.has(imageId);
+          if (!imageExists) imageData.createdAt = serverTimestamp();
+          batch.set(doc(imagesRef, imageId), imageData, { merge: imageExists });
+        }
+        orphanedImages.forEach(snapshot => batch.delete(snapshot.ref));
+        await batch.commit();
+
+        pendingUploads.forEach(({ option, imageId }) => {
+          option.imageId = imageId;
+          option.imageBlob = null;
+        });
         currentSetId = setRef.id;
         currentSetName = name;
         currentVisibility = visibility;
@@ -749,7 +806,7 @@ document.addEventListener('DOMContentLoaded', () => {
         showAppMessage('Набор сохранён.');
       } catch (error) {
         console.error('Ошибка сохранения набора:', error);
-        showAppMessage('Не удалось сохранить набор. Проверьте подключение и правила доступа Firestore.', true);
+        showAppMessage(error?.message || 'Не удалось сохранить набор и картинки. Проверьте подключение и правила доступа Firestore.', true);
       }
     });
   }
@@ -767,7 +824,9 @@ document.addEventListener('DOMContentLoaded', () => {
       imageBlob: null,
       imageUrl: '',
       imageName: typeof rawOption?.imageName === 'string' ? rawOption.imageName : '',
-      imageId: rawOption?.imageId || null
+      imageId: rawOption?.imageId || null,
+      imageWidth: null,
+      imageHeight: null
     };
   }
 
@@ -801,6 +860,47 @@ document.addEventListener('DOMContentLoaded', () => {
     renderEditors();
   }
 
+  async function hydrateCloudImages(setPath) {
+    const optionsWithImages = wheels
+      .slice(0, visibleCount)
+      .flatMap(wheel => wheel.options)
+      .filter(option => option.imageId);
+
+    if (!optionsWithImages.length) return 0;
+
+    const imageSnapshots = await getDocs(collection(db, `${setPath}/images`));
+    const imagesById = new Map(imageSnapshots.docs.map(snapshot => [snapshot.id, snapshot]));
+    let failedCount = 0;
+
+    optionsWithImages.forEach(option => {
+      try {
+        const imageSnapshot = imagesById.get(option.imageId);
+        if (!imageSnapshot) throw new Error('Документ изображения не найден.');
+
+        const imageData = imageSnapshot.data();
+        if (!imageData.data || typeof imageData.data.toUint8Array !== 'function') {
+          throw new Error('Некорректные данные изображения.');
+        }
+
+        if (imageData.contentType !== 'image/webp') throw new Error('Неподдерживаемый формат изображения.');
+        const bytes = imageData.data.toUint8Array();
+        const blob = new Blob([bytes], { type: imageData.contentType });
+        if (!blob.size || blob.size > 112640) throw new Error('Некорректный размер изображения.');
+
+        option.imageBlob = null;
+        option.imageUrl = URL.createObjectURL(blob);
+        option.imageName = typeof imageData.imageName === 'string' ? imageData.imageName : option.imageName;
+        option.imageWidth = Number.isFinite(imageData.width) ? imageData.width : null;
+        option.imageHeight = Number.isFinite(imageData.height) ? imageData.height : null;
+      } catch (error) {
+        failedCount += 1;
+        console.warn(`Не удалось восстановить изображение ${option.imageId}:`, error);
+      }
+    });
+
+    return failedCount;
+  }
+
   async function openSet(setId, button) {
     if (!currentUser) return;
     await runBusy(button, 'Загрузка…', async () => {
@@ -811,8 +911,17 @@ document.addEventListener('DOMContentLoaded', () => {
           return;
         }
         applySetData(snapshot.id, snapshot.data());
+        let imageWarning = '';
+        try {
+          const failedCount = await hydrateCloudImages(snapshot.ref.path);
+          if (failedCount) imageWarning = ` Не удалось загрузить изображений: ${failedCount}.`;
+        } catch (imageError) {
+          console.warn('Не удалось загрузить облачные изображения набора:', imageError);
+          imageWarning = ' Картинки временно не удалось загрузить, но текстовые данные открыты.';
+        }
+        renderEditors();
         setsDialog.close();
-        showAppMessage(`Набор «${currentSetName || 'Без названия'}» загружен.`);
+        showAppMessage(`Набор «${currentSetName || 'Без названия'}» загружен.${imageWarning}`, Boolean(imageWarning));
       } catch (error) {
         console.error('Ошибка загрузки набора:', error);
         showAppMessage('Не удалось загрузить набор. Попробуйте ещё раз.', true);
@@ -824,7 +933,15 @@ document.addEventListener('DOMContentLoaded', () => {
     if (!currentUser || !window.confirm(`Удалить набор «${name}»? Это действие нельзя отменить.`)) return;
     await runBusy(button, 'Удаление…', async () => {
       try {
-        await deleteDoc(doc(db, 'users', currentUser.uid, 'wheelSets', setId));
+        const setRef = doc(db, 'users', currentUser.uid, 'wheelSets', setId);
+        const imageSnapshots = await getDocs(collection(setRef, 'images'));
+        if (imageSnapshots.size > 498) {
+          throw new Error('В наборе слишком много изображений для безопасного удаления одной операцией.');
+        }
+        const batch = writeBatch(db);
+        imageSnapshots.forEach(snapshot => batch.delete(snapshot.ref));
+        batch.delete(setRef);
+        await batch.commit();
         if (currentSetId === setId) {
           currentSetId = null;
           currentSetName = '';
@@ -949,7 +1066,6 @@ document.addEventListener('DOMContentLoaded', () => {
           id: option.id || `copied-${nextOptionId++}`,
           text: typeof option.text === 'string' ? option.text : '',
           imageId: null,
-          imageUrl: null,
           imageName: typeof option.imageName === 'string' ? option.imageName : ''
         };
       })
@@ -990,7 +1106,7 @@ document.addEventListener('DOMContentLoaded', () => {
     else await action();
   }
 
-  function openPublicSet(snapshot) {
+  async function openPublicSet(snapshot) {
     const data = snapshot.data();
     const isOwner = Boolean(currentUser && data.ownerId === currentUser.uid);
     applySetData(isOwner ? snapshot.id : null, data, isOwner ? null : {
@@ -998,9 +1114,19 @@ document.addEventListener('DOMContentLoaded', () => {
       ownerId: data.ownerId || '',
       data
     });
+    let imageWarning = '';
+    try {
+      const failedCount = await hydrateCloudImages(snapshot.ref.path);
+      if (failedCount) imageWarning = ` Не удалось загрузить изображений: ${failedCount}.`;
+    } catch (imageError) {
+      console.warn('Не удалось загрузить изображения общего набора:', imageError);
+      imageWarning = ' Картинки временно не удалось загрузить.';
+    }
+    renderEditors();
     publicDialog.close();
     showGame();
-    if (!isOwner) showAppMessage('Открыт общедоступный набор. Чтобы изменить и сохранить его, сначала добавьте копию в свои.');
+    if (!isOwner) showAppMessage(`Открыт общедоступный набор. Чтобы изменить и сохранить его, сначала добавьте копию в свои.${imageWarning}`, Boolean(imageWarning));
+    else if (imageWarning) showAppMessage(imageWarning.trim(), true);
   }
 
   function renderPublicSets() {

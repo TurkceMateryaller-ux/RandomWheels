@@ -15,6 +15,49 @@ service cloud.firestore {
         && resource.data.visibility == 'public';
     }
 
+    function validImageDocument() {
+      return request.resource.data.keys().hasAll([
+          'data',
+          'contentType',
+          'imageName',
+          'width',
+          'height',
+          'size',
+          'createdAt',
+          'updatedAt'
+        ])
+        && request.resource.data.keys().hasOnly([
+          'data',
+          'contentType',
+          'imageName',
+          'width',
+          'height',
+          'size',
+          'createdAt',
+          'updatedAt'
+        ])
+        && request.resource.data.contentType == 'image/webp'
+        && request.resource.data.data is bytes
+        && request.resource.data.data.size() <= 112640
+        && request.resource.data.imageName is string
+        && request.resource.data.width is int
+        && request.resource.data.width > 0
+        && request.resource.data.width <= 512
+        && request.resource.data.height is int
+        && request.resource.data.height > 0
+        && request.resource.data.height <= 512
+        && request.resource.data.size is int
+        && request.resource.data.size >= 0
+        && request.resource.data.size <= 112640
+        && request.resource.data.size == request.resource.data.data.size()
+        && request.resource.data.createdAt is timestamp
+        && request.resource.data.updatedAt is timestamp;
+    }
+
+    function parentSetIsPublic(userId, setId) {
+      return get(/databases/$(database)/documents/users/$(userId)/wheelSets/$(setId)).data.visibility == 'public';
+    }
+
     match /users/{userId}/wheelSets/{setId} {
       allow get, list: if (signedIn() && request.auth.uid == userId)
         || isPublic();
@@ -34,6 +77,17 @@ service cloud.firestore {
         );
 
       allow delete: if signedIn() && request.auth.uid == userId;
+
+      match /images/{imageId} {
+        allow get, list: if (signedIn() && request.auth.uid == userId)
+          || parentSetIsPublic(userId, setId);
+
+        allow create, update: if signedIn()
+          && request.auth.uid == userId
+          && validImageDocument();
+
+        allow delete: if signedIn() && request.auth.uid == userId;
+      }
     }
 
     // Разрешает collectionGroup-запрос только для явно опубликованных наборов.
