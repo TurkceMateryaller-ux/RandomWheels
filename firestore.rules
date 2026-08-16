@@ -1,0 +1,45 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function validVisibility() {
+      return request.resource.data.visibility in ['private', 'public'];
+    }
+
+    function isPublic() {
+      return ('visibility' in resource.data)
+        && resource.data.visibility == 'public';
+    }
+
+    match /users/{userId}/wheelSets/{setId} {
+      allow get, list: if (signedIn() && request.auth.uid == userId)
+        || isPublic();
+
+      allow create: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.ownerId == request.auth.uid
+        && validVisibility();
+
+      allow update: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.ownerId == request.auth.uid
+        && validVisibility()
+        && (
+          (!('ownerId' in resource.data))
+          || !request.resource.data.diff(resource.data).affectedKeys().hasAny(['ownerId'])
+        );
+
+      allow delete: if signedIn() && request.auth.uid == userId;
+    }
+
+    // Разрешает collectionGroup-запрос только для явно опубликованных наборов.
+    // Документы без visibility не проходят это условие и остаются личными.
+    match /{path=**}/wheelSets/{setId} {
+      allow get, list: if isPublic();
+    }
+  }
+}

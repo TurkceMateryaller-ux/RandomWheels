@@ -1,0 +1,24 @@
+# Локальная конфигурация и переменные окружения
+firebase-config.txt
+.env
+.env.*
+
+# Ключи и учётные данные
+*serviceAccount*
+*.pem
+*.key
+
+# Зависимости и настройки редактора
+node_modules/
+.vscode/
+
+# Временные и системные файлы
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.tmp
+*.temp
+*.log
+*.bak
+*.swp
+*~

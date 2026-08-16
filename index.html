@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Колесо выбора</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <a class="brand-logo" href="https://vk.ru/turkcemateryaller" target="_blank" rel="noopener noreferrer" aria-label="Открыть группу Türkçe Materyaller во ВКонтакте">
+        <img src="assets/logo.png" alt="">
+      </a>
+      <div class="brand-copy">
+        <h1>Колесо выбора</h1>
+        <p>Türkçe Materyaller</p>
+      </div>
+    </div>
+    <div class="header-controls">
+      <div id="setup-toolbar" class="toolbar">
+        <fieldset class="count-control">
+          <legend>Количество колёс</legend>
+          <div class="segmented">
+            <input type="radio" name="count" id="count1" value="1" checked><label for="count1">1</label>
+            <input type="radio" name="count" id="count2" value="2"><label for="count2">2</label>
+            <input type="radio" name="count" id="count3" value="3"><label for="count3">3</label>
+            <input type="radio" name="count" id="count4" value="4"><label for="count4">4</label>
+          </div>
+        </fieldset>
+      </div>
+      <div id="game-toolbar" class="toolbar" hidden>
+        <button id="edit" class="button secondary" type="button">Редактировать</button>
+        <button id="spin-all" class="button primary" type="button">Крутить все</button>
+      </div>
+      <div class="cloud-actions">
+        <button id="save-set" class="button secondary" type="button">Сохранить набор</button>
+        <button id="my-sets" class="button secondary" type="button">Мои наборы</button>
+        <button id="public-sets" class="button secondary" type="button">Общие наборы</button>
+      </div>
+      <div id="auth-area" class="auth-area">
+        <button id="google-sign-in" class="button primary" type="button">Войти через Google</button>
+        <div id="user-profile" class="user-profile" hidden>
+          <img id="user-avatar" class="user-avatar" src="" alt="">
+          <span id="user-name" class="user-name"></span>
+          <button id="sign-out" class="button secondary compact" type="button">Выйти</button>
+        </div>
+      </div>
+      <a class="vk-link" href="https://vk.ru/turkcemateryaller" target="_blank" rel="noopener noreferrer" aria-label="Открыть группу Türkçe Materyaller во ВКонтакте">
+        <span class="vk-badge" aria-hidden="true">VK</span>
+        <span class="vk-label">Наша группа</span>
+      </a>
+    </div>
+  </header>
+
+  <main>
+    <section id="setup-view" class="view setup-view">
+      <div class="view-heading">
+        <div>
+          <p class="eyebrow">Настройка</p>
+          <h2>Подготовьте варианты</h2>
+        </div>
+      </div>
+      <div id="editors-container" class="editors-grid"></div>
+      <p id="setup-error" class="setup-error" role="alert" hidden></p>
+      <div class="setup-actions">
+        <button id="start-game" class="button primary start-game" type="button">Готово — перейти к колёсам</button>
+      </div>
+    </section>
+
+    <section id="game-view" class="view game-view" hidden>
+      <div id="wheels-container" class="wheels-grid" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <div id="app-message" class="app-message" role="status" aria-live="polite" hidden></div>
+
+  <dialog id="sets-dialog" class="sets-dialog" aria-labelledby="sets-title">
+    <div class="dialog-heading">
+      <div>
+        <p class="eyebrow">Cloud Firestore</p>
+        <h2 id="sets-title">Мои наборы</h2>
+      </div>
+      <button id="close-sets" class="dialog-close" type="button" aria-label="Закрыть">×</button>
+    </div>
+    <div id="sets-loading" class="sets-loading" hidden>Загрузка…</div>
+    <div id="sets-list" class="sets-list"></div>
+    <button id="new-set" class="button primary new-set" type="button">Создать новый набор</button>
+  </dialog>
+
+  <dialog id="save-dialog" class="sets-dialog save-dialog" aria-labelledby="save-title">
+    <div class="dialog-heading">
+      <h2 id="save-title">Сохранить набор</h2>
+      <button class="dialog-close" data-close-dialog="save-dialog" type="button" aria-label="Закрыть">×</button>
+    </div>
+    <label class="field-label" for="set-name">Название набора</label>
+    <input id="set-name" class="dialog-input" type="text" maxlength="80">
+    <fieldset class="visibility-field">
+      <legend>Кто может видеть набор</legend>
+      <label><input type="radio" name="visibility" value="private" checked> 🔒 Только мне</label>
+      <label><input type="radio" name="visibility" value="public"> 🌐 Доступно всем</label>
+    </fieldset>
+    <button id="confirm-save" class="button primary dialog-submit" type="button">Сохранить</button>
+  </dialog>
+
+  <dialog id="public-dialog" class="sets-dialog public-dialog" aria-labelledby="public-title">
+    <div class="dialog-heading">
+      <div><p class="eyebrow">Библиотека</p><h2 id="public-title">Общие наборы</h2></div>
+      <button class="dialog-close" data-close-dialog="public-dialog" type="button" aria-label="Закрыть">×</button>
+    </div>
+    <label class="field-label" for="public-search">Поиск по названию</label>
+    <input id="public-search" class="dialog-input" type="search" placeholder="Введите название набора">
+    <div id="public-loading" class="sets-loading" hidden>Загрузка…</div>
+    <div id="public-list" class="sets-list"></div>
+  </dialog>
+
+  <template id="editor-template">
+    <article class="editor-card">
+      <label class="field-label">Название колеса</label>
+      <input class="wheel-title-input" type="text" maxlength="50">
+      <div class="options-heading">Варианты</div>
+      <div class="options-list"></div>
+      <button class="button add-option" type="button">+ Добавить вариант</button>
+    </article>
+  </template>
+
+  <template id="wheel-template">
+    <article class="wheel-card">
+      <h2 class="wheel-title"></h2>
+      <div class="wheel-wrapper">
+        <div class="pointer" aria-hidden="true"></div>
+        <div class="wheel-stage">
+          <canvas class="wheel-canvas" width="600" height="600"></canvas>
+          <div class="wheel-center" aria-hidden="true"></div>
+        </div>
+      </div>
+      <button class="button primary spin-one" type="button">Крутить</button>
+      <div class="result" aria-live="polite">Результат появится здесь</div>
+    </article>
+  </template>
+
+  <script type="module" src="script.js"></script>
+</body>
+</html>
