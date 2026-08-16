@@ -29,14 +29,19 @@ document.addEventListener('DOMContentLoaded', () => {
     { fill: '#E68136', text: '#082D5A' }
   ];
   const maxFileSize = 5 * 1024 * 1024;
+  const maxProcessedImageSize = 100 * 1024;
+  const imageDimensionSteps = [512, 384, 320, 256];
+  const imageQualitySteps = [.82, .75, .68, .61, .54, .47, .4];
   const imageCache = new Map();
   let nextOptionId = 1;
 
   const createOption = text => ({
     id: `option-${nextOptionId++}`,
     text,
+    imageBlob: null,
     imageUrl: '',
-    imageName: ''
+    imageName: '',
+    imageId: null
   });
   const defaultOptions = () => [1, 2, 3, 4].map(number => createOption(`Вариант ${number}`));
   const wheels = Array.from({ length: 4 }, (_, index) => ({
@@ -101,11 +106,98 @@ document.addEventListener('DOMContentLoaded', () => {
     errorMessage.hidden = false;
   }
 
-  function releaseImage(option) {
+  function revokeOptionUrl(option) {
     if (option.imageUrl && option.imageUrl.startsWith('blob:')) URL.revokeObjectURL(option.imageUrl);
     imageCache.delete(option.imageUrl);
     option.imageUrl = '';
+  }
+
+  function releaseImage(option) {
+    revokeOptionUrl(option);
+    option.imageBlob = null;
     option.imageName = '';
+    option.imageId = null;
+  }
+
+  function canvasToWebP(canvas, quality) {
+    return new Promise((resolve, reject) => {
+      canvas.toBlob(blob => {
+        if (blob?.type === 'image/webp') resolve(blob);
+        else reject(new Error('Этот браузер не поддерживает преобразование изображений в WebP.'));
+      }, 'image/webp', quality);
+    });
+  }
+
+  async function decodeImageFile(file) {
+    if ('createImageBitmap' in window) {
+      try {
+        const bitmap = await createImageBitmap(file);
+        return {
+          source: bitmap,
+          width: bitmap.width,
+          height: bitmap.height,
+          release: () => bitmap.close()
+        };
+      } catch (error) {
+        console.info('createImageBitmap недоступен для этого файла, используется резервное декодирование.');
+      }
+    }
+    const sourceUrl = URL.createObjectURL(file);
+    const image = new Image();
+    try {
+      await new Promise((resolve, reject) => {
+        image.onload = resolve;
+        image.onerror = () => reject(new Error('Не удалось декодировать выбранное изображение.'));
+        image.src = sourceUrl;
+      });
+      return {
+        source: image,
+        width: image.naturalWidth,
+        height: image.naturalHeight,
+        release: () => URL.revokeObjectURL(sourceUrl)
+      };
+    } catch (error) {
+      URL.revokeObjectURL(sourceUrl);
+      throw error;
+    }
+  }
+
+  async function processSelectedImage(file) {
+    const decoded = await decodeImageFile(file);
+    try {
+      if (!decoded.width || !decoded.height) throw new Error('Изображение имеет некорректный размер.');
+      const originalMaxSide = Math.max(decoded.width, decoded.height);
+      const limits = imageDimensionSteps.filter((limit, index) => index === 0 || originalMaxSide > limit);
+      let lastResult = null;
+
+      for (const maxSide of limits) {
+        const scale = Math.min(1, maxSide / originalMaxSide);
+        const width = Math.max(1, Math.round(decoded.width * scale));
+        const height = Math.max(1, Math.round(decoded.height * scale));
+        if (lastResult && lastResult.width === width && lastResult.height === height) continue;
+        const canvas = document.createElement('canvas');
+        canvas.width = width;
+        canvas.height = height;
+        const context = canvas.getContext('2d');
+        if (!context) throw new Error('Браузер не поддерживает обработку изображения через Canvas.');
+        context.drawImage(decoded.source, 0, 0, width, height);
+
+        for (const quality of imageQualitySteps) {
+          const blob = await canvasToWebP(canvas, quality);
+          lastResult = { blob, width, height };
+          if (blob.size <= maxProcessedImageSize) return lastResult;
+        }
+      }
+      if (lastResult && lastResult.blob.size <= maxProcessedImageSize) return lastResult;
+      throw new Error('Не удалось уменьшить изображение примерно до 100 КБ. Выберите менее детализированный файл.');
+    } finally {
+      decoded.release();
+    }
+  }
+
+  function webPFileName(originalName) {
+    const baseName = originalName.replace(/\.[^.]+$/, '').trim() || 'image';
+    return `${baseName}.webp`;
   }
 
   function createImageTools(option, wheelIndex) {
@@ -121,7 +213,7 @@ document.addEventListener('DOMContentLoaded', () => {
     picker.className = 'image-picker';
     picker.htmlFor = fileId;
     picker.innerHTML = '<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg><span>Добавить картинку</span>';
-    fileInput.addEventListener('change', event => {
+    fileInput.addEventListener('change', async event => {
       const file = event.target.files[0];
       if (!file) return;
       if (file.size > maxFileSize) {
@@ -134,12 +226,36 @@ document.addEventListener('DOMContentLoaded', () => {
         fileInput.value = '';
         return;
       }
-      releaseImage(option);
-      option.imageUrl = URL.createObjectURL(file);
-      option.imageName = file.name;
-      wheels[wheelIndex].result = null;
-      clearError();
-      renderEditors();
+      const pickerText = picker.querySelector('span:last-child');
+      fileInput.disabled = true;
+      picker.classList.add('processing');
+      picker.setAttribute('aria-disabled', 'true');
+      pickerText.textContent = 'Обработка…';
+      try {
+        const processed = await processSelectedImage(file);
+        const existingImageId = option.imageId || null;
+        revokeOptionUrl(option);
+        option.imageBlob = processed.blob;
+        option.imageUrl = URL.createObjectURL(processed.blob);
+        option.imageName = webPFileName(file.name);
+        option.imageId = existingImageId;
+        wheels[wheelIndex].result = null;
+        clearError();
+        console.info('Изображение обработано:', {
+          width: processed.width,
+          height: processed.height,
+          sizeKB: Math.round(processed.blob.size / 1024)
+        });
+        renderEditors();
+      } catch (error) {
+        console.error('Ошибка обработки изображения:', error);
+        showError(error?.message || 'Не удалось обработать изображение. Попробуйте другой файл.');
+        fileInput.value = '';
+        fileInput.disabled = false;
+        picker.classList.remove('processing');
+        picker.removeAttribute('aria-disabled');
+        pickerText.textContent = 'Добавить картинку';
+      }
     });
     tools.append(fileInput, picker);
 
@@ -558,6 +674,7 @@ document.addEventListener('DOMContentLoaded', () => {
       options: wheel.options.map(option => ({
         id: option.id,
         text: option.text,
+        imageId: option.imageId || null,
         imageUrl: null,
         imageName: option.imageName || ''
       }))
@@ -647,8 +764,10 @@ document.addEventListener('DOMContentLoaded', () => {
     return {
       id: rawOption?.id || `option-${nextOptionId++}`,
       text: typeof rawOption?.text === 'string' ? rawOption.text : '',
+      imageBlob: null,
       imageUrl: '',
-      imageName: typeof rawOption?.imageName === 'string' ? rawOption.imageName : ''
+      imageName: typeof rawOption?.imageName === 'string' ? rawOption.imageName : '',
+      imageId: rawOption?.imageId || null
     };
   }
 
@@ -829,6 +948,7 @@ document.addEventListener('DOMContentLoaded', () => {
         return {
           id: option.id || `copied-${nextOptionId++}`,
           text: typeof option.text === 'string' ? option.text : '',
+          imageId: null,
           imageUrl: null,
           imageName: typeof option.imageName === 'string' ? option.imageName : ''
         };
