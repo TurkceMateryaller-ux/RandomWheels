@@ -706,7 +706,7 @@ document.addEventListener('DOMContentLoaded', () => {
           name: currentSetName,
           wheelCount: visibleCount,
           wheels: serializeWheels()
-        });
+        }, saveSetButton);
       }
       return;
     }
@@ -1069,16 +1069,17 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  function sanitizeStoredWheels(data) {
+  function sanitizeStoredWheels(data, imageIdMap = new Map()) {
     return (Array.isArray(data.wheels) ? data.wheels : []).slice(0, 4).map(wheel => ({
       title: restoredWheelTitle(wheel?.title),
       options: (Array.isArray(wheel?.options) ? wheel.options : []).map(rawOption => {
         const option = typeof rawOption === 'string' ? { text: rawOption } : (rawOption || {});
+        const copiedImageId = option.imageId ? imageIdMap.get(option.imageId) || null : null;
         return {
           id: option.id || `copied-${nextOptionId++}`,
           text: typeof option.text === 'string' ? option.text : '',
-          imageId: null,
-          imageName: typeof option.imageName === 'string' ? option.imageName : ''
+          imageId: copiedImageId,
+          imageName: copiedImageId && typeof option.imageName === 'string' ? option.imageName : ''
         };
       })
     }));
@@ -1090,12 +1091,47 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
     const action = async () => {
+      let operationStage = 'read';
       try {
+        const sourceRef = doc(db, sourcePath);
+        const sourceImages = await getDocs(collection(sourceRef, 'images'));
+        operationStage = 'prepare';
+        const sourceImagesById = new Map(sourceImages.docs.map(snapshot => [snapshot.id, snapshot]));
+        const referencedImageIds = new Set();
+        (Array.isArray(data.wheels) ? data.wheels : []).slice(0, 4).forEach(wheel => {
+          (Array.isArray(wheel?.options) ? wheel.options : []).forEach(rawOption => {
+            const option = typeof rawOption === 'string' ? null : rawOption;
+            if (typeof option?.imageId === 'string' && option.imageId) referencedImageIds.add(option.imageId);
+          });
+        });
+
+        const copyRef = doc(collection(db, 'users', currentUser.uid, 'wheelSets'));
+        const copyImagesRef = collection(copyRef, 'images');
+        const imageIdMap = new Map();
+        const imagesToCopy = [];
+        let missingImageCount = 0;
+
+        referencedImageIds.forEach(oldImageId => {
+          const sourceImage = sourceImagesById.get(oldImageId);
+          if (!sourceImage) {
+            missingImageCount += 1;
+            return;
+          }
+          const newImageRef = doc(copyImagesRef);
+          imageIdMap.set(oldImageId, newImageRef.id);
+          imagesToCopy.push({ sourceImage, newImageRef });
+        });
+
+        const operationCount = 1 + imagesToCopy.length;
+        if (operationCount > 450) {
+          throw new Error('В наборе слишком много картинок: для безопасного копирования допускается не более 449 изображений.');
+        }
+
         const copyName = `Копия — ${data.name || 'Без названия'}`;
         const copiedData = {
           name: copyName,
           wheelCount: Math.max(1, Math.min(4, Number(data.wheelCount) || 1)),
-          wheels: sanitizeStoredWheels(data),
+          wheels: sanitizeStoredWheels(data, imageIdMap),
           ownerId: currentUser.uid,
           authorName: currentUser.displayName || 'Пользователь',
           visibility: 'private',
@@ -1103,18 +1139,53 @@ document.addEventListener('DOMContentLoaded', () => {
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp()
         };
-        const copyRef = doc(collection(db, 'users', currentUser.uid, 'wheelSets'));
-        await setDoc(copyRef, copiedData);
+        const batch = writeBatch(db);
+        batch.set(copyRef, copiedData);
+        imagesToCopy.forEach(({ sourceImage, newImageRef }) => {
+          const sourceImageData = sourceImage.data();
+          batch.set(newImageRef, {
+            data: sourceImageData.data,
+            contentType: sourceImageData.contentType,
+            imageName: sourceImageData.imageName,
+            width: sourceImageData.width,
+            height: sourceImageData.height,
+            size: sourceImageData.size,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp()
+          });
+        });
+        operationStage = 'write';
+        await batch.commit();
+
         applySetData(copyRef.id, copiedData);
-        currentCopiedFrom = sourcePath;
+        let restoreWarning = false;
+        try {
+          const failedCount = await hydrateCloudImages(copyRef.path);
+          restoreWarning = failedCount > 0;
+        } catch (imageError) {
+          restoreWarning = imagesToCopy.length > 0;
+          console.warn('Копия создана, но её изображения не удалось сразу открыть:', imageError);
+        }
+        renderEditors();
         if (publicDialog.open) publicDialog.close();
-        showAppMessage('Набор добавлен в “Мои наборы”.');
+        await loadSets();
+        const hasWarning = missingImageCount > 0 || restoreWarning;
+        const warningText = missingImageCount > 0
+          ? ` Не найдено картинок: ${missingImageCount}; соответствующие варианты скопированы без них.`
+          : (restoreWarning ? ' Некоторые картинки не удалось сразу отобразить; они сохранены в копии.' : '');
+        showAppMessage(`Набор и картинки добавлены в “Мои наборы”.${warningText}`, hasWarning);
       } catch (error) {
         console.error('Ошибка копирования набора:', error);
-        showAppMessage('Не удалось добавить набор в «Мои наборы».', true);
+        const fallback = operationStage === 'read'
+          ? 'Не удалось прочитать картинки публичного набора.'
+          : (operationStage === 'write'
+              ? 'Не удалось записать личную копию набора и картинок.'
+              : 'Не удалось подготовить набор и картинки к копированию.');
+        const details = error?.message ? ` Причина: ${error.message}` : '';
+        showAppMessage(`${fallback}${details}`, true);
       }
     };
-    if (button) await runBusy(button, 'Добавление…', action);
+    if (button) await runBusy(button, 'Копирование набора и картинок…', action);
     else await action();
   }
 
